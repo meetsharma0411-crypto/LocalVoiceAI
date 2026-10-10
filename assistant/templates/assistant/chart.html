@@ -1,0 +1,417 @@
+
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>मेरा हिंदी AI Assistant</title>
+<style>
+body {
+    margin: 0;
+    padding: 20px;
+    background: #101827;
+    color: #f5f7fb;
+    font-family: Arial, sans-serif;
+}
+main {
+    max-width: 800px;
+    margin: 20px auto;
+}
+.panel {
+    padding: 22px;
+    margin: 18px 0;
+    background: #1b2638;
+    border: 1px solid #35445a;
+    border-radius: 14px;
+}
+input {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 13px;
+    margin: 8px 0;
+    background: #101827;
+    color: white;
+    border: 1px solid #60718a;
+    border-radius: 8px;
+}
+button {
+    padding: 12px 16px;
+    margin: 4px;
+    border: 0;
+    border-radius: 8px;
+    color: white;
+    background: #3478f6;
+    cursor: pointer;
+}
+.green { background: #13836b; }
+.red { background: #c83e4d; }
+#status { color: #ffd479; }
+#conversation {
+    white-space: pre-wrap;
+    line-height: 1.7;
+    overflow-wrap: anywhere;
+}
+.user { color: #8dc0ff; }
+.bot { color: #83e0b6; }
+audio { width: 100%; margin-top: 12px; }
+</style>
+</head>
+<body>
+<main>
+    <h1>🎙️ मेरा हिंदी Local AI Assistant</h1>
+    <p>Ollama + Gemma + Whisper + Piper</p>
+
+    <section class="panel">
+        <h2>💬 हिंदी Chat</h2>
+        <form id="chatForm">
+            {% csrf_token %}
+            <input id="message" placeholder="अपना सवाल लिखें..." required>
+            <button type="submit">भेजें</button>
+        </form>
+    </section>
+
+    <section class="panel">
+        <h2>🎤 Voice Assistant</h2>
+        <button id="recordBtn">🎤 बोलना शुरू करें</button>
+        <button id="wakeBtn" class="green">👂 Wake Word शुरू करें</button>
+        <p id="status">तैयार है।</p>
+        <p>Wake word: <b>हे असिस्टेंट</b></p>
+        <p>Wake word बोलें, रुकें, फिर अपना सवाल बोलें।</p>
+        <h3>बातचीत</h3>
+        <div id="conversation"></div>
+        <h3>🔊 AI की आवाज़</h3>
+        <audio id="player" controls></audio>
+    </section>
+</main>
+
+<script>
+const csrf = document.querySelector(
+    "[name=csrfmiddlewaretoken]"
+).value;
+
+const statusEl = document.getElementById("status");
+const conversation = document.getElementById("conversation");
+const player = document.getElementById("player");
+const recordBtn = document.getElementById("recordBtn");
+const wakeBtn = document.getElementById("wakeBtn");
+
+let recording = false;
+let recorder = null;
+let stream = null;
+let chunks = [];
+let wakeRunning = false;
+let waitingForQuestion = false;
+
+function status(text) {
+    statusEl.textContent = text;
+}
+
+function addMessage(role, text) {
+    const p = document.createElement("p");
+    p.className = role;
+    p.textContent = (role === "user" ? "आप: " : "Gemma: ") + text;
+    conversation.appendChild(p);
+    conversation.scrollTop = conversation.scrollHeight;
+}
+
+async function playAudio(url) {
+    player.src = url + "?t=" + Date.now();
+    try {
+        await player.play();
+    } catch (e) {
+        status("जवाब तैयार है। आवाज़ सुनने के लिए Play दबाएँ।");
+    }
+}
+
+async function sendText(message) {
+    const response = await fetch("/chat/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-CSRFToken": csrf
+        },
+        body: new URLSearchParams({message})
+    });
+
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Chat error");
+    addMessage("bot", data.reply);
+}
+
+document.getElementById("chatForm").addEventListener(
+    "submit", async event => {
+        event.preventDefault();
+        const input = document.getElementById("message");
+        const message = input.value.trim();
+        if (!message) return;
+
+        addMessage("user", message);
+        input.value = "";
+        status("Gemma जवाब दे रहा है...");
+
+        try {
+            await sendText(message);
+            status("तैयार है।");
+        } catch (e) {
+            status("Error: " + e.message);
+        }
+    }
+);
+
+async function processAudio(blob, mode) {
+    const form = new FormData();
+    form.append("audio", blob, "voice.webm");
+    form.append("mode", mode);
+
+    const response = await fetch("/voice/", {
+        method: "POST",
+        headers: {"X-CSRFToken": csrf},
+        body: form
+    });
+
+    const data = await response.json();
+    if (!response.ok) {
+        throw new Error(data.error || "Voice error");
+    }
+
+    if (data.transcript) {
+        addMessage("user", data.transcript);
+    }
+
+    if (data.waiting_for_command) {
+        waitingForQuestion = true;
+        status("अब अपना सवाल बोलें...");
+    }
+
+    if (data.reply) {
+        addMessage("bot", data.reply);
+        waitingForQuestion = false;
+        await playAudio(data.audio_url);
+    }
+
+    return data;
+}
+
+// Button mode: click once to record, click again to stop.
+recordBtn.addEventListener("click", async () => {
+    if (wakeRunning) {
+        status("पहले Wake Word mode बंद करें।");
+        return;
+    }
+
+    if (!recording) {
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({
+                audio: true
+            });
+
+            chunks = [];
+            recorder = new MediaRecorder(stream);
+
+            recorder.ondataavailable = event => {
+                if (event.data.size) chunks.push(event.data);
+            };
+
+            recorder.onstop = async () => {
+                stream.getTracks().forEach(track => track.stop());
+                stream = null;
+
+                const blob = new Blob(chunks, {
+                    type: recorder.mimeType || "audio/webm"
+                });
+
+                status("आवाज़ को हिंदी text में बदला जा रहा है...");
+
+                try {
+                    await processAudio(blob, "command");
+                    status("तैयार है।");
+                } catch (e) {
+                    status("Error: " + e.message);
+                }
+            };
+
+            recorder.start();
+            recording = true;
+            recordBtn.textContent = "⏹ रिकॉर्डिंग बंद करें";
+            recordBtn.classList.add("red");
+            status("बोलिए...");
+
+        } catch (e) {
+            status("Microphone error: " + e.message);
+        }
+    } else {
+        recording = false;
+        recordBtn.textContent = "🎤 बोलना शुरू करें";
+        recordBtn.classList.remove("red");
+        recorder.stop();
+    }
+});
+
+function recordClip(mediaStream, duration) {
+    return new Promise((resolve, reject) => {
+        let rec;
+        try {
+            rec = new MediaRecorder(mediaStream);
+        } catch (e) {
+            reject(e);
+            return;
+        }
+
+        const parts = [];
+        rec.ondataavailable = e => {
+            if (e.data.size) parts.push(e.data);
+        };
+        rec.onerror = () => reject(new Error("Recording failed"));
+        rec.onstop = () => resolve(new Blob(parts, {
+            type: rec.mimeType || "audio/webm"
+        }));
+
+        rec.start();
+        setTimeout(() => {
+            if (rec.state !== "inactive") rec.stop();
+        }, duration);
+    });
+}
+
+// Local Whisper checks short clips for the wake phrase.
+wakeBtn.addEventListener("click", async () => {
+    if (wakeRunning) {
+        wakeRunning = false;
+        status("Wake Word mode बंद हो रहा है...");
+        return;
+    }
+
+    if (recording) {
+        status("पहले recording बंद करें।");
+        return;
+    }
+
+    let mic;
+    try {
+        mic = await navigator.mediaDevices.getUserMedia({audio: true});
+        wakeRunning = true;
+        waitingForQuestion = false;
+        wakeBtn.textContent = "⏹ Wake Word बंद करें";
+        wakeBtn.classList.add("red");
+
+        while (wakeRunning) {
+            status(waitingForQuestion
+                ? "सवाल सुन रहा है..."
+                : '"हे असिस्टेंट" बोलें...');
+
+            const blob = await recordClip(mic, 4000);
+            if (!wakeRunning) break;
+
+            try {
+                await processAudio(
+                    blob,
+                    waitingForQuestion ? "command" : "listen"
+                );
+            } catch (e) {
+                status("Voice error: " + e.message);
+            }
+        }
+    } catch (e) {
+        status("Microphone error: " + e.message);
+    } finally {
+        if (mic) mic.getTracks().forEach(track => track.stop());
+        wakeRunning = false;
+        wakeBtn.textContent = "👂 Wake Word शुरू करें";
+        wakeBtn.classList.remove("red");
+        status("Wake Word mode बंद है।");
+    }
+});
+</script>
+</body>
+</html>
+```
+
+## 6. `settings.py` में Media settings
+
+File: `D:\LocalVoiceAI\VoiceProject\settings.py`
+
+File के अंत में ये दो lines जोड़ें:
+
+```python
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR / "media"
+```
+
+`INSTALLED_APPS` में `'assistant'` और `TEMPLATES` में `'APP_DIRS': True` पहले से होने चाहिए।
+
+## 7. Hindi Piper voice model download करें
+
+Piper के Hindi `rohan` voice model की `.onnx` और `.onnx.json` files उपलब्ध हैं। <Cite refs={["turn593576search0","turn593576search2"]}/>
+
+PowerShell में चलाएँ:
+
+```powershell
+cd D:\LocalVoiceAI
+New-Item -ItemType Directory -Force models
+```
+
+पहली file:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx" `
+  -OutFile "D:\LocalVoiceAI\models\hi_IN-rohan-medium.onnx"
+```
+
+दूसरी file:
+
+```powershell
+Invoke-WebRequest `
+  -Uri "https://huggingface.co/rhasspy/piper-voices/resolve/main/hi/hi_IN/rohan/medium/hi_IN-rohan-medium.onnx.json" `
+  -OutFile "D:\LocalVoiceAI\models\hi_IN-rohan-medium.onnx.json"
+```
+
+दोनों files डाउनलोड होने में समय लग सकता है। पहली बार download के लिए internet आवश्यक है।
+
+## 8. Packages install करें
+
+```powershell
+cd D:\LocalVoiceAI
+.\venv\Scripts\Activate.ps1
+
+python -m pip install django requests faster-whisper piper-tts
+```
+
+Whisper का `base` model भी पहली बार internet से डाउनलोड होगा। Download पूरा होने के बाद cached model को local इस्तेमाल किया जा सकता है।
+
+## 9. Assistant चलाएँ
+
+पहले terminal में Ollama चलाएँ:
+
+```powershell
+ollama run gemma3:1b
+```
+
+दूसरे terminal में Django चलाएँ:
+
+```powershell
+cd D:\LocalVoiceAI
+.\venv\Scripts\Activate.ps1
+python manage.py check
+python manage.py runserver
+```
+
+फिर browser में खोलें:
+
+[http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+
+## 10. Test करने का सही तरीका
+
+1. `🎤 बोलना शुरू करें` दबाएँ।
+2. हिंदी में बोलें: “भारत की राजधानी क्या है?”
+3. Recording बंद करें और transcription तथा Gemma के जवाब का इंतज़ार करें।
+4. जवाब हिंदी text में दिखाई देना चाहिए और Piper हिंदी voice में audio बनाएगा।
+5. Wake-word mode के लिए `Wake Word शुरू करें` दबाएँ, “हे असिस्टेंट” बोलें, फिर अपना प्रश्न बोलें।
+
+**अगर आवाज़ नहीं आती या error आता है**, तो सबसे पहले यह command चलाकर output भेजें:
+
+```powershell
+python -m pip show piper-tts faster-whisper
+```
+
+ध्यान दें: इस implementation में wake-word detection के लिए हर चार सेकंड के audio clip को Whisper से transcribe किया जाता है। यह वास्तविक low-power, हमेशा चालू रहने वाला dedicated wake-word engine नहीं है; CPU पर कुछ delay हो सकता है।
